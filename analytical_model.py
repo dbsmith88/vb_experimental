@@ -1,332 +1,304 @@
-from preprocessing import PPGraph
-from sorted_heap import SortedHeap
-from genetic_algorithm import GeneticAlgorithm
-from multiple_linear_regression import MultipleLinearRegression
-import statsmodels.api as sm
-import multiprocessing as mp
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import pandas as pd
 import numpy as np
+import sklearn.metrics as skm
+import sklearn as sk
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+import statsmodels.api as sm
+import statsmodels.stats.outliers_influence as smo
 import scipy.stats
-import itertools
-import copy
-import time
-import os
 
 
-use_parallel = True
+class AnalyticalModel:
 
-
-class AttributeTransformation:
-    default_transformation = {
-        'nodes': {
-            1: {'function': 'log', 'args': {'c': 'x1'}},
-            2: {'function': 'log10', 'args': {'c': 'x1'}},
-            3: {'function': 'square', 'args': {'c': 'x1'}},
-            6: {'function': 'reciprocal', 'args': {'c': 'x1'}},
-            7: {'function': 'polynomial', 'args': {'c': ['x1'], 'r': 'Response'}},
-            8: {'function': 'power', 'args': {'c': 'x1', 'p': 3}},
-            9: {'function': 'squareroot', 'args': {'c': 'x1'}},
-        },
-        'edges': []
-    }
-
-    def __init__(self, data, response_data):
-        self._data = copy.copy(data)
-        if type(self._data) is not pd.DataFrame:
-            self._data = self._data.to_frame()
-        self._data["Response"] = response_data.values
-        self.transformed_data = {}
-        for n, v in self.default_transformation["nodes"].items():
-            v['args']['c'] = data.name
-            if 'r' in v['args'].keys():
-                v['args']['r'] = response_data.columns.values.tolist()[0]
-        self.data = PPGraph(self._data, self.default_transformation).data
-        self.columns = self.data.columns
-        d1 = response_data.to_numpy().flatten()
-        self.data = self.data.drop("Response", axis=1)
-        for f in self.data.columns:
-            if not np.any(np.isnan(self.data[[f]])):
-                d2 = self.data[[f]].to_numpy().flatten()
-                if d2.min() == d2.max():            # d2 is constant
-                    pearsons = [np.nan, np.nan]
-                else:
-                    pearsons = scipy.stats.pearsonr(d1, d2)
-                self.transformed_data[f] = pearsons[0]
-
-    def evaluate(self, threshold, transformation_threshold):
-        best_pearson = 0
-        best_transform = None
-        for t, v in self.transformed_data.items():
-            if abs(v) > best_pearson:
-                best_pearson = abs(v)
-                best_transform = t
-        if best_transform != self.columns[0]:
-            if best_pearson / abs(self.transformed_data[self.columns[0]]) > (1. + transformation_threshold):
-                return [
-                    best_transform,
-                    self.transformed_data[best_transform],
-                    self.data[best_transform]
-                ]
-        return [
-            self.columns[0],
-            self.transformed_data[self.columns[0]],
-            self.data[self.columns[0]]
-        ]
-
-
-class AttributeInteraction:
-
-    interaction_polynomial = {
-        'nodes': {
-            1: {'function': 'product', 'args': {'c': ['x1', 'x2'], 'r': 'Response'}},
-        },
-        'edges': []
-    }
-
-    def __init__(self, data, response_data):
-        self._data = copy.copy(data)
-        self._data["Response"] = copy.copy(response_data.values)
-        self._columns = self._data.columns
-        self.transformed_data = {}
-
-        self.interaction_polynomial["nodes"][1]["args"]["c"] = list(self._columns)
-        self.data = PPGraph(self._data, self.interaction_polynomial).data
-        self.columns = self.data.columns
-        self.interaction_column = [c for c in list(self.columns) if "IP" in c][0]
-        d1 = response_data.to_numpy().flatten()
-        d2 = self.data[self.interaction_column].to_numpy().flatten()
-        pearsons = scipy.stats.pearsonr(d1, d2)
-        self.transformed_data[self.interaction_column] = round(pearsons[0], 5)
-
-    def evaluate(self, threshold):
-        return [
-            self.interaction_column,
-            self.transformed_data[self.interaction_column],
-            self.data[self.interaction_column]
-        ]
-
-
-parallel_results = []
-
-
-class AutomatedMultipleLinearRegression:
-    pearsons_threshold = 0.1
-    pearsons_change_threshold = 0.0
-    vif_threshold = 5.0
-    training_split = 0.8
-    data_attribute_ratio = 10
-    parallel_threshold = 10000
-
-    def __init__(self, data, response, genetic=False, evaluation="rmse", skip_transformations=False, interactions=True, vb_replicate=False):
-        print("Starting automated multiple linear regression")
-        self.response = response
+    def __init__(self, data: pd.DataFrame, target: str, training_split=0.8, one_out=False, model_config=None):
+        self.target = target
         self.data = data
-        self.evaluation = evaluation
-        self.response_data = copy.copy(self.data[[response]])
-        self.attribute_data = copy.copy(self.data).drop(response, axis=1)
-        self.interaction_data = pd.DataFrame()
-        self.vb_replicate = vb_replicate
-        self.attribute_transformations = None
-        self.valid_transformations = None
-        self.valid_attributes = None
-        if interactions:
-            self.process_interactions()
-            self.attribute_data = pd.concat([self.attribute_data, self.interaction_data], axis=1)
-        self.process_attributes(bypass=skip_transformations)           # step 1: Generate all transformation, validate transformations
-        self.all_combinations = []
-        self.best_models = SortedHeap(n=10, target=0.0)
-        # step 2: Generate all combinations from valid/best transformations
-        print("{} total attributes.".format(len(self.valid_attributes)))
-        # self.attribute_data.to_csv(os.path.join("data", "attribute_data.csv"))
-        # self.data.to_csv(os.path.join("data", "transformed_data.csv"))
-        if self.valid_attributes.shape[1] > 15 or genetic:     # 5 base variables
-            # use genetic algorithm
-            if genetic:
-                print("Genetic algorithm flag active.")
+        self.attribute_data = self.data.drop(target, axis=1)
+        self.target_data = self.data[[target]]
+        self.attributes = self.attribute_data.columns
+        self.one_out = one_out
+        self.training_split = training_split
+        self.train_n = int(self.data.shape[0] * self.training_split) if not self.one_out else int(self.data.shape[0])
+        # self.train_n = int(self.data.shape[0])
+        self.model = None
+        self.model_configs = model_config
+        self.results = None
+        self.confusion = None
+        self.coef = None
+        self.r2 = None
+        self.r2_adjusted = None
+        self.mse = None
+        self.rmse = None
+        self.anderson = None
+        self.anderson_p = None
+        self.residuals = None
+        self.predictions = None
+        self.aic = None
+        self.aaic = None
+        self.bic = None
+        self.eval = None
+        self.build_model()
+
+    def build_mlr(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with a multiple linear regression model.
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        self.model = sk.linear_model.LinearRegression(fit_intercept=True, **params)
+        self.results = self.model.fit(train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = self.results.coef_
+        res = test_y - pred_y
+        self.residuals = res
+
+    def build_linear_svr(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with a Linear Support Vector Regressor
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        n_train_x = sk.preprocessing.scale(train_x, axis=1)
+        self.model = sk.svm.LinearSVR(dual=True, fit_intercept=True, loss='squared_epsilon_insensitive', random_state=0, **params)
+        self.results = self.model.fit(n_train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = self.results.coef_
+        res = test_y - pred_y
+        self.residuals = res
+
+    def build_gbr(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with a Gradient Boost Regressor
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        self.model = GradientBoostingRegressor(random_state=0, **params)
+        self.results = self.model.fit(train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = None
+        res = test_y - pred_y
+        self.residuals = res
+
+    def build_elastic_net(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with an Elastic Net CV
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        self.model = sk.linear_model.ElasticNetCV(**params)
+        self.results = self.model.fit(train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = self.results.coef_
+        res = test_y - pred_y
+        self.residuals = res
+
+    def build_rfr(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with a Random Forest Regressor
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        self.model = RandomForestRegressor(random_state=0, **params)
+        self.results = self.model.fit(train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = None
+        res = test_y - pred_y
+        self.residuals = res
+
+    def build_model(self, weights=None):
+        test_n = self.train_n if not self.one_out else 0
+        test_m = self.data.shape[0] if not self.one_out else self.data.shape[0]
+        train_data = self.data[0:self.train_n]
+        test_data = self.data[test_n:test_m]
+        train_x = train_data[self.attributes]
+        train_y = train_data[[self.target]]
+        test_x = test_data[self.attributes]
+        test_y = test_data[[self.target]]
+        weights = np.ones(train_x.shape[0]) if weights is None else weights
+
+        y = train_y.to_numpy().flatten()
+        x = train_x.to_numpy()
+        model_configs = {} if self.model_configs is None else self.model_configs
+        if "type" in model_configs.keys():
+            params = model_configs["params"] if "params" in model_configs.keys() else {}
+            if model_configs["type"] == "MLR":
+                self.build_mlr(x, y, test_x, test_y, params)
+            elif model_configs["type"] == "LinearSVR":
+                self.build_linear_svr(x, y, test_x, test_y, params)
+            elif model_configs["type"] == "GBR":
+                self.build_gbr(x, y, test_x, test_y, params)
+            elif model_configs["type"] == "RFR":
+                self.build_rfr(x, y, test_x, test_y, params)
+            elif model_configs["type"] == "ElasticNetCV":
+                self.build_elastic_net(x, y, test_x, test_y, params)
             else:
-                print("Running genetic algorithm due to large attribute combination set.")
-            self.run_genetic_algorithm()
+                self.build_mlr(x, y, test_x, test_y, params)
         else:
-            for i in range(1, int(self.data.shape[0]/self.data_attribute_ratio)):
-                self.all_combinations += list(itertools.combinations(list(self.valid_attributes.columns), i))
-            self.valid_combinations = []
-            print("Validating all {} potential attribute combinations...".format(len(self.all_combinations)))
-            global use_parallel
-            if len(self.all_combinations) >= self.parallel_threshold:
-                use_parallel = True
-                print("Potential attribute combinations above {}, turning parallel functions on.".format(self.parallel_threshold))
+            model_configs["type"] = "MLR"
+            self.model_configs = model_configs
+            self.build_mlr(x, y, test_x, test_y, {})
+
+        n = float(self.data.shape[0])
+        p = float(self.data.shape[1] - 1.)
+        sse = np.sum(np.power(self.residuals, 2))
+        sst = np.sum(np.power(test_y - np.mean(test_y), 2))
+        self.r2 = ((sst - sse) / sst).round(4)
+        self.r2_adjusted = (self.r2 - (1. - self.r2) * 2. / (n - 3.)).round(4)
+        self.rmse = (np.sqrt(sse / (n - p - 1.))).round(4)
+        self.mse = (np.power(self.rmse, 2)).round(4)
+        self.aic = (n * np.log(sse / n) + (2. * p) + n + 2.).round(4)
+        self.aaic = (self.aic + (2. * (p + 1.) * (p + 2.))/(n - p - 2.)).round(4)
+        self.bic = ((n * np.log(sse/n)) + (p * np.log(n))).round(4)
+        self.results.aic = self.aic
+        self.results.bic = self.bic
+
+        self.anderson = scipy.stats.anderson(self.residuals)
+        self.anderson_pvalue(replicate=True)
+
+    def anderson_pvalue(self, replicate=True):
+        ad = self.anderson.statistic
+        if replicate:
+            if ad < 2:
+                p = 1. - np.exp(-1.2337141/ad) / np.sqrt(ad) * (2.00012+(.247105-(.0649821-(.0347962-(.011672-.00168691*ad)*ad)*ad)*ad)*ad)
             else:
-                use_parallel = False
-            if use_parallel:
-                self.validate_combinations_parallel()               # step 3: Validate all combinations in parallel
+                p = 1. - np.exp(-1.*np.exp(1.0776-(2.30695-(.43424-(.082433-(.008056 -.0003146*ad)*ad)*ad)*ad)*ad))
+        else:
+            # https://www.spcforexcel.com/knowledge/basic-statistics/anderson-darling-test-for-normality
+            ad = ad * (1. + (.75/50.) + 2.25/(50.**2))
+            if ad >= 0.6:
+                p = 1. - np.exp(1.2937 - 5.709*ad + 0.0186*(ad**2))
+            elif 0.34 < ad < 0.6:
+                p = 1. - np.exp(0.9177 - 4.279*ad - 1.38*(ad**2))
+            elif 0.2 < ad < 0.34:
+                p = 1.0 - np.exp(-8.318 + 42.796*ad - 59.938*(ad**2))
             else:
-                self.validate_combinations()                        # step 3: Validate all combinations
-            print("Found {} valid combinations".format(len(self.valid_combinations)))
-            self.results = []
-            print("Building models...")
-            self.build_models()                                     # step 4: Build models and validate results
+                p = 1.0 - np.exp(-13.436 + 101.14*ad - 223.73*(ad**2))
+        self.anderson_p = p
 
-    def process_attributes(self, bypass=False):
-        if bypass:
-            self.valid_attributes = self.attribute_data
-            self.valid_transformations = []
-            for ad in list(self.attribute_data.columns):
-                self.valid_transformations.append([ad, np.nan, self.data[ad]])
-            return
-        # step 1.a Perform all possible transformations on attribute data
-        print("Calculating attribute transformations...")
-        self.attribute_transformations = [
-            AttributeTransformation(self.attribute_data[a], self.response_data) for a in self.attribute_data.columns
-        ]
-        # step 1.b Evalute all attribute transformations for best selection
-        print("Evaluating all attribute transformations...")
-        self.valid_transformations = [
-            t.evaluate(self.pearsons_threshold, self.pearsons_change_threshold) for t in self.attribute_transformations
-        ]
-        self.valid_attributes = pd.DataFrame()
-        for vt in self.valid_transformations:
-            if vt is not None:
-                if vt[0] not in self.data.columns:
-                    self.data[vt[0]] = vt[2]
-                self.valid_attributes[vt[0]] = vt[2]
-
-    def process_interactions(self):
-        print("Calculating attribute interactions...")
-        attribute_combinations = list(itertools.combinations(self.attribute_data.columns, 2))
-        print("Found {} attribute interactions".format(len(attribute_combinations)))
-        attribute_interactions = [
-            AttributeInteraction(self.attribute_data[list(a)], self.response_data) for a in attribute_combinations
-        ]
-        # step 1.b Evalute all attribute transformations for best selection
-        print("Evaluating all attribute interactions...")
-        valid_interactions = [
-            t.evaluate(self.pearsons_threshold) for t in attribute_interactions
-        ]
-        valid_interactions = list(filter(None, valid_interactions))
-        for vt in valid_interactions:
-            if vt is not None:
-                if vt[0] not in self.interaction_data.columns:
-                    self.interaction_data[vt[0]] = vt[2]
-                if vt[0] not in self.data.columns:
-                    self.data[vt[0]] = vt[2]
-        del attribute_combinations
-        del attribute_interactions
-        del valid_interactions
-
-    def validate_combinations_p(self, c):
-        subset = self.data[list(c)]
+    def evaluate_VIF(self, threshold=5.0):
         valid = True
-        if len(c) > 1:
-            for i in range(0, len(c)):
-                subset_data = subset.drop(c[i], axis=1)
-                mod = sm.OLS(subset[c[i]], sm.add_constant(subset_data))
+        subset = self.data[list(self.attributes)]
+        if len(self.attributes) > 1:
+            for i in range(0, len(self.attributes)):
+                subset_data = subset.drop(self.attributes[i], axis=1)
+                mod = sm.OLS(subset[self.attributes[i]], sm.add_constant(subset_data))
                 res = mod.fit()
                 vif2 = 1. / (1. - res.rsquared)
-                if vif2 > self.vif_threshold:
+                if vif2 > threshold:
                     valid = False
                     break
         if valid:
-            return c
-
-    def validate_combinations_parallel(self):
-        pool = mp.Pool(mp.cpu_count())
-        parallel_results = pool.map(self.validate_combinations_p, [c for c in self.all_combinations])
-        pool.close()
-        pool.join()
-        parallel_results = list(filter(None, parallel_results))
-        self.valid_combinations = parallel_results
-
-    def validate_combinations(self):
-        for c in self.all_combinations:
-            valid = True
-            subset = self.data[list(c)]
-            if len(c) > 1:
-                for i in range(0, len(c)):
-                    subset_data = subset.drop(c[i], axis=1)
-                    mod = sm.OLS(subset[c[i]], sm.add_constant(subset_data))
-                    res = mod.fit()
-                    vif2 = 1./(1. - res.rsquared)
-                    if vif2 > self.vif_threshold:
-                        valid = False
-                        break
-            if valid:
-                self.valid_combinations.append(list(c))
-
-    def build_models_parallel(self, c):
-        m_data = copy.copy(self.data[list(c)])
-        m_data[self.response] = self.response_data.values
-        m = MultipleLinearRegression(m_data, self.response, one_out=self.vb_replicate)
-        return m
-
-    def build_models(self):
-        # TODO: if # of combinations exceed 10000, split into blocks of 5000 (limit memory useage)
-        if use_parallel:
-            pool = mp.Pool(mp.cpu_count())
-            parallel_results = pool.map(self.build_models_parallel, [c for c in self.valid_combinations])
-            pool.close()
-            pool.join()
-            [self.best_models.add(m, m.evaluate(use=self.evaluation)) for m in parallel_results]
-            self.results = self.best_models
+            return True
         else:
-            for c in self.valid_combinations:
-                m_data = copy.copy(self.data[list(c)])
-                m_data[self.response] = self.response_data.values
-                m = MultipleLinearRegression(m_data, self.response, training_split=0.80, one_out=self.vb_replicate)
-                self.best_models.add(m, m.evaluate(use=self.evaluation))
-            self.results = self.best_models
-        if self.results.s_heap[0][1] is not None:
-            self.results.s_heap[0][1].plot_results()
-            self.results.s_heap[0][1].print_summary2()
-            self.results.print(self.evaluation)
+            return False
+
+    def evaluate(self, use="rmse", ad=True, check_VIF=False, exclude=True):
+        use = use.lower()
+        self.eval = use
+        if use == "r2":
+            metric = abs(self.r2) - 1.0
+        elif use == "r2a":
+            metric = abs(self.results.rsquared_adj) - 1.0
+        elif use == "rmse":
+            metric = self.rmse
+        elif use == "press":
+            r = smo.OLSInfluence(self.results)
+            metric = r.ess_press
+        elif use == "aic":
+            metric = self.aic
+        elif use == "caic":
+            k = self.data.shape[1] - 1
+            n = self.results.nobs
+            metric = self.aic + ((2*(k*k) + 2*k)/(n - k - 1))
+        elif use == "bic":
+            metric = self.bic
         else:
-            print("No valid models found or all model outputs failed evaluation.")
+            metric = self.mse
+        if ad:
+            if self.anderson_p < 0.05:
+                if exclude:
+                    metric = float("inf")
+                else:
+                    metric = 10000
+        if check_VIF:
+            if not self.evaluate_VIF():
+                if exclude:
+                    metric = float("inf")
+                else:
+                    metric = 10000      # Allows for model to still be on the list but will lets better models get added.
+        return metric
 
-    def run_genetic_algorithm_parallel(self, i):
-        validated_data = copy.copy(self.data[list(self.valid_attributes.columns)])
-        validated_data[self.response] = self.response_data.values
-        ga = GeneticAlgorithm(data=validated_data, response=self.response, attributes=list(self.valid_attributes.columns), evaluation=self.evaluation, vb_replicate=self.vb_replicate)
-        ga.execute()
-        return ga.best_models.s_heap
+    def plot_results(self):
+        test_data = self.data[self.train_n:] if not self.one_out else self.data[0:self.train_n]
+        test_y = test_data[[self.target]]
+        pred_y = self.predictions
 
-    def run_genetic_algorithm(self):
-        use_parallel = False
-        if use_parallel:
-            concurrent_ga = 4
-            pool = mp.Pool(mp.cpu_count())
-            parallel_results = pool.map(self.run_genetic_algorithm_parallel, [i for i in range(0, concurrent_ga)])
-            pool.close()
-            pool.join()
-            for m in parallel_results:
-                for mi in m:
-                    metric = mi[1].evaluate(use=self.evaluation)
-                    self.best_models.add(mi[1], metric)
-            self.results = self.best_models
-        else:
-            validated_data = copy.copy(self.data[list(self.valid_attributes.columns)])
-            validated_data[self.response] = self.response_data.values
-            ga = GeneticAlgorithm(data=validated_data, response=self.response, attributes=list(self.valid_attributes.columns), evaluation=self.evaluation, vb_replicate=self.vb_replicate)
-            ga.execute()
-            self.results = ga.best_models
-        if self.results.s_heap[0][1] is not None:
-            self.results.s_heap[0][1].plot_results()
-            self.results.s_heap[0][1].print_summary2()
-            self.results.print(self.evaluation)
-        else:
-            print("No valid models found or all model outputs failed evaluation.")
+        plt.subplot(2, 1, 1)
+        plt.title("{} Model Results ({}: {}) \n Attributes: {}".format(
+            self.model_configs["type"], self.eval, getattr(self, self.eval), ", ".join(list(self.attributes)))
+        )
+        plot_x = np.arange(0, self.residuals.shape[0])
+        plt.scatter(plot_x, test_y, color='gray', linewidth=1)
+        plt.scatter(plot_x, pred_y, color='red', linewidth=1)
+        plt.ylabel("Prediction/Actual")
+        plt.axhline(y=np.mean(pred_y), linewidth=0.5, color='black')
+        red_patch = mpatches.Patch(color='red', label='Prediction')
+        gray_patch = mpatches.Patch(color='gray', label='Actual')
+        plt.legend(handles=[gray_patch, red_patch])
 
+        plt.subplot(2, 1, 2)
+        plt.scatter(pred_y, self.residuals, facecolors='none', edgecolors='blue')
+        plt.axhline(linewidth=0.5, color='black')
+        plt.ylabel("Fitted vs Residuals")
+        plt.show()
 
-if __name__ == "__main__":
-    t0 = time.time()
+    def print_summary(self):
+        test_data = self.data[self.train_n:] if not self.one_out else self.data[0:self.train_n]
+        test_y = test_data[[self.target]]
+        pred_y = self.predictions
+        max_error = skm.max_error(test_y, pred_y)
+        mean_absolute_error = skm.mean_absolute_error(test_y, pred_y)
+        median_absolute_error = skm.median_absolute_error(test_y, pred_y)
+        print("\n----------------- Model Summary ----------------")
+        print("Type: {}\t\tEvaluation Criteria: {}".format(self.model_configs["type"], self.eval).expandtabs(15))
+        print("Response: {}\t\tAttributes: {}".format(self.target, ", ".join(list(self.attributes))).expandtabs(15))
+        print("Total Data Records: {}\t\tTraining Data Split: {}".format(self.data.shape[0], self.training_split).expandtabs(15))
+        print("Total Training Records: {}\t\tTotal Testing Records: {}".format(self.train_n, test_data.shape[0]).expandtabs(15))
+        print("R Squared: {}\t\tMean Squared Error: {}\t\tRoot Mean Squared Error: {}".format(round(self.r2,4), round(self.mse,4), round(self.rmse,4)).expandtabs(15))
+        print("Max Error: {}\t\tMean Absolute Error: {}\t\tMedian Absolute Error: {}".format(
+            round(max_error, 4), round(mean_absolute_error,4), round(median_absolute_error,4)).expandtabs(15))
 
-    # ------------ Data input and setup configuration ---------- #
-    _raw_data = pd.read_excel(os.path.join("data", "VB_Data_1a.xlsx"))                  # Data source
-    _target = 'Response'                                                                # Column in data source to use as target attribute
-    _raw_data = _raw_data.drop("ID", axis=1)
-    # _raw_data = _raw_data.drop(["x6","x7","x8","x9"], axis=1)
-    # _raw_data = _raw_data.drop(["x5","x6","x7","x8","x9"], axis=1)
-    #_raw_data = _raw_data.drop(["x1","x2","x3"], axis=1)
-
-    amlr = AutomatedMultipleLinearRegression(_raw_data, _target, genetic=True, skip_transformations=False, evaluation="rmse", vb_replicate=True)
-
-    t1 = time.time() - t0
-    print("Time elapsed: {} sec".format(round(t1, 3)))
+    def print_summary2(self):
+        print(self.results.summary())

@@ -32,6 +32,7 @@ class NeuralNet:
         :param predictions: The number of predictions, timesteps, to predict.
         :param observations: The number of observations for each timestep
         """
+        print("Starting neural network creation")
         self.data = data
         self.features_considered = features
         self.timestep = timestep
@@ -56,17 +57,17 @@ class NeuralNet:
         self.x_train_multi, self.y_train_multi = None, None
         self.x_val_multi, self.y_val_multi = None, None
         self.train_data_multi, self.val_data_multi = None, None
-
+        print("Initializing data structures")
         self.initialize()
-
         self.epochs = epochs
         self.evaluation_interval = self.train_split
-
         self.model = None
         self.multi_step_history = None
+        self.prediction = None
+        print("Initialization completed")
 
     def multivariate_data(self, start_index, end_index, history_size, target_size, step):
-        data_target = self.dataset[:, 1]
+        data_target = self.data["Response"].to_numpy().flatten()
         data = []
         labels = []
 
@@ -109,9 +110,10 @@ class NeuralNet:
         num_in = self.create_time_steps(len(history))
         num_out = len(true_future)
 
-        plt.plot(num_in, np.array(history[:, 1]), label='History')
+        plt.plot(num_in, np.array(history), 'ko-', label='History', linewidth=0.5)
         plt.plot(np.arange(num_out) / self.future_target, np.array(true_future), 'bo',
                  label='True Future')
+        plt.axhline(np.mean(history), color="gray", linewidth=0.5)
         if prediction.any():
             plt.plot(np.arange(num_out) / self.future_target, np.array(prediction), 'ro',
                      label='Predicted Future')
@@ -131,33 +133,69 @@ class NeuralNet:
         self.val_data_multi = self.val_data_multi.batch(self.BATCH_SIZE).repeat()
 
     def define_model(self, layers):
+        print("Creating sequential NN model")
         self.model = tf.keras.models.Sequential()
         layer_count = len(layers)
         current_layer = 1
-        for l in layers:
-            layer = getattr(tf.keras.layers, l["name"])
-            if layer_count != current_layer or layer_count == 1:
-                self.model.add(layer(
-                    int(l["nodes"]),
-                    input_shape=self.x_train_multi.shape[-2:],
-                    **l["kwargs"])
-                )
-            else:
-                self.model.add(layer(
-                    int(l["nodes"]),
-                    **l["kwargs"])
-                )
-            current_layer += 1
+        try:
+            for l in layers:
+                layer = getattr(tf.keras.layers, l["name"])
+                # if layer_count != current_layer or layer_count == 1:
+                if current_layer == 1:
+                    if "Conv" in l["name"]:
+                        self.model.add(layer(
+                            int(l["filters"]), int(l["kernel_size"]),
+                            input_shape=self.x_train_multi.shape[-2:],
+                            **l["kwargs"])
+                        )
+                    elif "nodes" in l.keys():
+                        self.model.add(layer(
+                            int(l["nodes"]),
+                            input_shape=self.x_train_multi.shape[-2:],
+                            **l["kwargs"])
+                        )
+                    elif "kwargs" in l.keys():
+                        self.model.add(layer(input_shape=self.x_train_multi.shape[-2:], **l["kwargs"]))
+                    else:
+                        self.model.add(layer(input_shape=self.x_train_multi.shape[-2:]))
+                else:
+                    if "Conv" in l["name"]:
+                        self.model.add(layer(
+                            int(l["filters"]), int(l["kernel_size"]),
+                            **l["kwargs"])
+                        )
+                    elif "nodes" in l.keys():
+                        self.model.add(layer(
+                            int(l["nodes"]),
+                            **l["kwargs"])
+                        )
+                    elif "kwargs" in l.keys():
+                        self.model.add(layer(**l["kwargs"]))
+                    else:
+                        self.model.add(layer())
+                current_layer += 1
+        except ValueError as e:
+            print("Invalid {} Layer configuration: {}".format(current_layer, e))
+            return False
         self.model.add(tf.keras.layers.Dense(self.future_target))
+        print("Completed model creation")
+        return True
 
     def define_optimizer(self, name, loss_function, kwargs):
+        print("Compiling optimizer for model")
         optimizer = getattr(tf.keras.optimizers, name)
-        self.model.compile(optimizer=optimizer(**kwargs), loss=loss_function, metrics=['accuracy'])
+        self.model.compile(optimizer=optimizer(**kwargs), loss=loss_function, metrics=[
+            'accuracy',
+            tf.keras.metrics.MeanSquaredError(),
+            tf.keras.metrics.RootMeanSquaredError()
+        ])
+        print("Completed compiling optimizer")
 
     def get_model_details(self):
         return self.model.summary()
 
     def train_model(self, early_stop=True, early_stop_monitor='val_loss', early_stop_patience=10):
+        print("Starting training model...")
         early_stop_function = [keras.callbacks.EarlyStopping(monitor=early_stop_monitor, patience=early_stop_patience)]
         if not early_stop:
             early_stop_function = None
@@ -170,10 +208,14 @@ class NeuralNet:
             validation_steps=50,
             callbacks=early_stop_function
         )
+        print("Completed training model")
         self.plot_train_history(self.multi_step_history, 'Multi-Step Training and validation loss')
 
         for x, y in self.val_data_multi.take(1):
-            self.multi_step_plot(x[0], y[0], self.model.predict(x)[0])
+            self.prediction = self.model.predict(x)[0]
+            history = self.data["Response"].to_numpy().flatten()
+            # history = history[self.evaluation_interval:history.shape[0] - self.predictions - 1]
+            self.multi_step_plot(history, y[0], self.prediction)
 
     def get_predictions(self):
         predictions = []
@@ -194,31 +236,45 @@ if __name__ == "__main__":
     # name: A valid tensorflow keras layer. https://www.tensorflow.org/api_docs/python/tf/keras/layers
     # nodes: The number of nodes for the layer
     # activation_function: The activation function to use for the layer. https://www.tensorflow.org/api_docs/python/tf/keras/activations
-    _layers = [
-        {"name": "LSTM", "nodes": 8, "kwargs": {"activation": "swish", "return_sequences": True}},
-        {"name": "Dropout", "nodes": 0.2, "kwargs": {}},
-        {"name": "GRU", "nodes": 32, "kwargs": {"activation": "tanh", "return_sequences": True}},
-        {"name": "LSTM", "nodes": 8, "kwargs": {"activation": "swish"}}
-    ]
     # _layers = [
-    #     {"name": "GRU", "nodes": 32, "kwargs": {"activation": "tanh", "return_sequences": True}},
-    #     {"name": "GRU", "nodes": 32, "kwargs": {"activation": "tanh"}}
+    #     {"name": "Conv3D", "filters": 32, "kernel_size": 32, "kwargs": {"activation": "relu"}},
+    #     {"name": "MaxPool3D", "kwargs":{"pool_size": (2, 2, 1)}},
+    #     # {"name": "Conv3D", "filters": 16, "kernel_size": 16, "kwargs": {"activation": "relu"}},
+    #     # {"name": "MaxPool3D", "kwargs":{"pool_size": (2, 2, 1)}},
+    #     # {"name": "Conv3D", "filters": 8, "kernel_size": 8, "kwargs": {"activation": "relu"}},
+    #     # {"name": "MaxPool3D", "kwargs":{"pool_size": (2, 2, 1)}},
+    #     {"name": "BatchNormalization"},
+    #     {"name": "Dense", "nodes": 4, "kwargs": {"activation": None}},
+    #     {"name": "Dropout", "nodes": 0.5, "kwargs": {}},
+    #     # {"name": "Dense", "nodes": 32, "kwargs": {}}
+    # ]
+    _layers = [
+        {"name": "LSTM", "nodes": 16, "kwargs": {"activation": "swish", "return_sequences": True}},
+        {"name": "Dense", "nodes": 16, "kwargs": {}},
+        {"name": "Dense", "nodes": 16, "kwargs": {}},
+        {"name": "Dense", "nodes": 16, "kwargs": {}},
+        {"name": "LSTM", "nodes": 16, "kwargs": {"activation": "swish"}},
+        {"name": "LayerNormalization"},
+    ]
+
+    # _layers = [
+    #     {"name": "GRU", "nodes": 8, "kwargs": {"activation": "tanh", "return_sequences": True}},
+    #     {"name": "GRU", "nodes": 8, "kwargs": {"activation": "tanh"}}
     # ]
     # Optimizer to be used by the neural network.
     # name: A valid tensorflow keras optimizer. https://www.tensorflow.org/api_docs/python/tf/keras/optimizers
     # kwargs: The arguments for the specific
     # rho: Discounting factor for gradient, defaults to 0.9
     # loss_function: The loss function for the optimizer. https://www.tensorflow.org/api_docs/python/tf/keras/losses
-    _optimizer = {"name": "RMSprop", "loss_function": "mae", "kwargs": {"learning_rate": 0.002, "rho": 0.85}}
-    # _optimizer = {"name": "Adam", "loss_function": "mse", "kwargs": {"learning_rate": 0.001}}
+    # _optimizer = {"name": "RMSprop", "loss_function": "mae", "kwargs": {"learning_rate": 0.002, "rho": 0.85}}
+    _optimizer = {"name": "Adam", "loss_function": "mse", "kwargs": {"learning_rate": 0.002}}
 
     # Create Neural Net class object, initializing all configuration settings.
     # Additional arguments (with default values): training_ratio=0.8, predictions=3, observations=1, epochs=20
     rnn = NeuralNet(_raw_data, _features_considered, _timestamp, _target)
-    rnn.define_model(_layers)
-    rnn.define_optimizer(_optimizer["name"], _optimizer["loss_function"], _optimizer["kwargs"])
-    rnn.get_model_details()     # Returns the configuration and layered structure of the neural network
-    rnn.train_model(early_stop=False)
-
-    results = rnn.get_predictions()
-    print(results)
+    if rnn.define_model(_layers):
+        rnn.define_optimizer(_optimizer["name"], _optimizer["loss_function"], _optimizer["kwargs"])
+        rnn.get_model_details()     # Returns the configuration and layered structure of the neural network
+        rnn.train_model(early_stop=True)
+        results = rnn.get_predictions()
+        print(results)
