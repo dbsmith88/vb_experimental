@@ -125,9 +125,10 @@ class AutomatedModelBuilder:
             genetic=False,
             evaluation="rmse",
             skip_transformations=False,
-            interactions=True,
-            vb_replicate=False,
-            model_config=None
+            skip_interactions=False,
+            one_out=False,
+            model_config=None,
+            ga_config=None
     ):
         print("Starting automated multiple linear regression")
         self.response = response
@@ -136,12 +137,13 @@ class AutomatedModelBuilder:
         self.response_data = copy.copy(self.data[[response]])
         self.attribute_data = copy.copy(self.data).drop(response, axis=1)
         self.interaction_data = pd.DataFrame()
-        self.vb_replicate = vb_replicate
+        self.one_out = one_out
         self.attribute_transformations = None
         self.valid_transformations = None
         self.valid_attributes = None
         self.model_config = model_config
-        if interactions:
+        self.ga_config = ga_config
+        if not skip_interactions:
             self.process_interactions()
             self.attribute_data = pd.concat([self.attribute_data, self.interaction_data], axis=1)
         self.process_attributes(bypass=skip_transformations)           # step 1: Generate all transformation, validate transformations
@@ -266,7 +268,7 @@ class AutomatedModelBuilder:
     def build_models_parallel(self, c, model_config):
         m_data = copy.copy(self.data[list(c)])
         m_data[self.response] = self.response_data.values
-        m = AnalyticalModel(m_data, self.response, one_out=self.vb_replicate, model_config=model_config)
+        m = AnalyticalModel(m_data, self.response, one_out=self.one_out, model_config=model_config)
         return m
 
     def build_models(self):
@@ -285,7 +287,7 @@ class AutomatedModelBuilder:
             for c in self.valid_combinations:
                 m_data = copy.copy(self.data[list(c)])
                 m_data[self.response] = self.response_data.values
-                m = AnalyticalModel(m_data, self.response, training_split=0.80, one_out=self.vb_replicate, model_config=self.model_config)
+                m = AnalyticalModel(m_data, self.response, training_split=0.80, one_out=self.one_out, model_config=self.model_config)
                 self.best_models.add(m, m.evaluate(use=self.evaluation))
             self.results = self.best_models
         if self.results.s_heap[0][1] is not None:
@@ -295,36 +297,62 @@ class AutomatedModelBuilder:
         else:
             print("No valid models found or all model outputs failed evaluation.")
 
+    def set_ga_config(self):
+        if self.ga_config is None and use_parallel:
+            self.ga_config = {
+                "config":
+                    {
+                        "mutate_percent": 0.2,
+                        "no_change_threshold": 10,
+                        "population_size": 50
+                    },
+                "mutate_config":
+                    {
+                        "add_percent": 0.2,
+                        "delete_percent": 0.2
+                    }
+            }
+        else:
+            self.ga_config = {
+                "config":
+                    {
+                        "mutate_percent": 0.2,
+                        "no_change_threshold": 20,
+                        "population_size": 100
+                    },
+                "mutate_config":
+                    {
+                        "add_percent": 0.2,
+                        "delete_percent": 0.2
+                    }
+            }
+
     def run_genetic_algorithm_parallel(self, i):
         validated_data = copy.copy(self.data[list(self.valid_attributes.columns)])
         validated_data[self.response] = self.response_data.values
-
-        rnd = random.Random()
-        rnd.seed(a=i)
-        m_percent = [0.05, 0.1, 0.2, 0.3]
-        change_threshold = [5, 8, 10, 15, 20]
-        add_delete = [0.1, 0.2, 0.3]
 
         ga = GeneticAlgorithm(
             data=validated_data,
             response=self.response,
             attributes=list(self.valid_attributes.columns),
             evaluation=self.evaluation,
-            vb_replicate=self.vb_replicate,
-            mutate_percent=m_percent[2],
-            no_change_threshold=change_threshold[4],
+            seed=i,
+            one_out=self.one_out,
             model_config=self.model_config,
+            **self.ga_config["config"]
         )
-        ga.execute(add_percent=add_delete[1], delete_percent=add_delete[1])
+        ga.execute(**self.ga_config["mutate_config"])
         return ga.best_models.s_heap
 
     def run_genetic_algorithm(self):
-        use_parallel = False
+        use_parallel = False if len(self.valid_transformations) <= 21 else True
+        # use_parallel = False
+        self.set_ga_config()
         if use_parallel:
-            # concurrent_ga = mp.cpu_count()
-            concurrent_ga = 4
+            concurrent_ga = mp.cpu_count()
+            # concurrent_ga = 4
             pool = mp.Pool(concurrent_ga)
-            pool_results = [pool.apply_async(self.run_genetic_algorithm_parallel, (i, model_config)) for i in range(0, concurrent_ga)]
+            pool_results = [pool.apply_async(self.run_genetic_algorithm_parallel, (i,)) for i in range(0, concurrent_ga)]
             parallel_results = []
             for r in pool_results:
                 parallel_results.append(r.get())
@@ -344,14 +372,10 @@ class AutomatedModelBuilder:
                 attributes=list(self.valid_attributes.columns),
                 evaluation=self.evaluation,
                 model_config=self.model_config,
-                vb_replicate=self.vb_replicate,
-                mutate_percent=0.2,
-                no_change_threshold=10,
-                parallel=False,
-                population_size=200
+                one_out=self.one_out,
+                **self.ga_config["config"]
             )
-            # ga.execute()
-            ga.execute(add_percent=0.2, delete_percent=0.2)
+            ga.execute(**self.ga_config["mutate_config"])
             self.results = ga.best_models
         if self.results.s_heap[0][1] is not None:
             self.results.s_heap[0][1].plot_results()
@@ -372,15 +396,31 @@ if __name__ == "__main__":
     # _raw_data = _raw_data.drop(["x6","x7","x8","x9"], axis=1)
     #_raw_data = _raw_data.drop(["x1","x2","x3"], axis=1)
 
-    model_config = {"type": "LinearSVR"}
+    model_config = {"type": "GBR"}
+    ga_config = {
+        "config":
+            {
+                "mutate_percent": 0.2,
+                "no_change_threshold": 10,
+                "population_size": 50
+            },
+        "mutate_config":
+            {
+                "add_percent": 0.2,
+                "delete_percent": 0.2
+            }
+    }
     amlr = AutomatedModelBuilder(
         _raw_data,
         _target,
-        genetic=True,
+
+        genetic=False,
         skip_transformations=False,
+        skip_interactions=False,
         evaluation="rmse",
-        vb_replicate=False,
-        model_config=model_config
+        one_out=False,
+        model_config=model_config,
+        ga_config=None
     )
 
     t1 = time.time() - t0

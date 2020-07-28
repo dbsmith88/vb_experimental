@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import sklearn.metrics as skm
 import sklearn as sk
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
 import statsmodels.api as sm
 import statsmodels.stats.outliers_influence as smo
 import scipy.stats
@@ -71,7 +71,7 @@ class AnalyticalModel:
         :return:
         """
         n_train_x = sk.preprocessing.scale(train_x, axis=1)
-        self.model = sk.svm.LinearSVR(dual=True, fit_intercept=True, loss='squared_epsilon_insensitive', random_state=0, **params)
+        self.model = sk.svm.LinearSVR(fit_intercept=True, loss='squared_epsilon_insensitive', random_state=0, **params)
         self.results = self.model.fit(n_train_x, train_y)
         pred_y = self.results.predict(test_x)
         self.predictions = pred_y
@@ -137,6 +137,40 @@ class AnalyticalModel:
         res = test_y - pred_y
         self.residuals = res
 
+    def build_stacker(self, train_x, train_y, test_x, test_y, params):
+        """
+        Build, fit and predict with a stacking regressor ensemble.
+        :param train_x:
+        :param train_y:
+        :param test_x:
+        :param test_y:
+        :param params:
+        :return:
+        """
+        # n_train_x = sk.preprocessing.scale(train_x, axis=1)
+        if "estimators" in params.keys():
+            estimators = []
+            for e in params["estimators"]:
+                # example estimator would be 'linear_model.RidgeCV', where the group and type must match the scikit-learn model
+                sm = e.split(".")
+                estimator = (sm[1], getattr(getattr(sk, sm[0]), sm[1]))
+                estimators.append(estimator)
+        else:
+            estimators = [
+                ('lr', sk.linear_model.LinearRegression()),
+                # ('svr', sk.svm.LinearSVR(random_state=42)),
+                ('enet', sk.linear_model.ElasticNetCV()),
+                ('ridge', sk.linear_model.RidgeCV())
+            ]
+        self.model = StackingRegressor(estimators=estimators, final_estimator=RandomForestRegressor(random_state=42),  passthrough=False, n_jobs=-1)
+        self.results = self.model.fit(train_x, train_y)
+        pred_y = self.results.predict(test_x)
+        self.predictions = pred_y
+        test_y = test_y.to_numpy().flatten()
+        self.coef = None
+        res = test_y - pred_y
+        self.residuals = res
+
     def build_model(self, weights=None):
         test_n = self.train_n if not self.one_out else 0
         test_m = self.data.shape[0] if not self.one_out else self.data.shape[0]
@@ -163,6 +197,8 @@ class AnalyticalModel:
                 self.build_rfr(x, y, test_x, test_y, params)
             elif model_configs["type"] == "ElasticNetCV":
                 self.build_elastic_net(x, y, test_x, test_y, params)
+            elif model_configs["type"] == "Stacker":
+                self.build_stacker(x, y, test_x, test_y, params)
             else:
                 self.build_mlr(x, y, test_x, test_y, params)
         else:
@@ -257,7 +293,7 @@ class AnalyticalModel:
                 if exclude:
                     metric = float("inf")
                 else:
-                    metric = 10000      # Allows for model to still be on the list but will lets better models get added.
+                    metric = 10000      # Allows for model to still be on the list but will let better models get added.
         return metric
 
     def plot_results(self):

@@ -7,15 +7,15 @@ import copy
 
 class GeneticAlgorithm:
 
-    def __init__(self, data, response, attributes, seed=42, evaluation="rmse", vb_replicate=False,
-                 generations=1000, population_size=100, mutate_percent=0.2, parent_percent=0.2,
+    def __init__(self, data, response, attributes, seed=42, evaluation="rmse", one_out=False,
+                 generations=100, population_size=100, mutate_percent=0.2, parent_percent=0.2,
                  no_change_threshold=20, model_config=None, parallel=False
                  ):
         self.data = data
         self.response = response
         self.attributes_list = attributes
         self.evaluation = evaluation
-        self.vb_replicate = vb_replicate
+        self.one_out = one_out
         self.max_attribute_n = int(self.data.shape[0]/10) \
             if len(self.attributes_list) > int(self.data.shape[0]/10) else len(self.attributes_list)
         self.p_generation = []
@@ -29,7 +29,7 @@ class GeneticAlgorithm:
         self.mutate_precent = mutate_percent
         self.parent_n = int(population_size * parent_percent)
         self.nochange_threshold = no_change_threshold
-        self.parallel = parallel
+        self.parallel = False
         self.initialize_population()
 
     def initialize_population(self):
@@ -123,22 +123,22 @@ class GeneticAlgorithm:
         while g < self.generations and not stopping_condition:
             # calculate fitness for i_generation
             if self.parallel:
-                pool_results = [pool.apply_async(self.fitness_function, (self.data[list(m)], self.data[self.response].values, self.response, self.model_config, self.vb_replicate)) for m in self.i_generation]
-                parallel_results = [p.get() for p in pool_results]
+                parallel_results = [pool.apply(self.fitness_function, (self.data[list(m)], self.data[self.response].values, self.response, self.model_config, self.one_out)) for m in self.i_generation]
+                # parallel_results = [p.get() for p in pool_results]
                 for m in parallel_results:
                     metric = m.evaluate(use=self.evaluation, check_VIF=True, exclude=False)
                     generation_sorting.add(m, metric)
                     self.best_models.add(m, metric)
             else:
                 for m in self.i_generation:
-                    i_m = self.fitness_function(self.data[list(m)], self.data[self.response].values, self.response, self.model_config, self.vb_replicate)
+                    i_m = self.fitness_function(self.data[list(m)], self.data[self.response].values, self.response, self.model_config, self.one_out)
                     metric = i_m.evaluate(use=self.evaluation, check_VIF=True, exclude=False)
                     generation_sorting.add(i_m, metric)
                     self.best_models.add(i_m, metric)
             top_models = generation_sorting.get_top(self.parent_n)
             crossover_results = self.perform_crossover(top_models)
-            death_pool = generation_sorting.get_bottom(self.population_n - 10)  # save top 10 parents
-            survivors_n = self.population_n - 30 if len(death_pool) == self.population_n - 10 else len(death_pool)
+            death_pool = generation_sorting.get_bottom(int(self.population_n * 0.9))  # save top 10 parents
+            survivors_n = int(self.population_n * 0.7) if len(death_pool) == (self.population_n * 0.1) else len(death_pool)
             survivors = self.random.sample(death_pool, survivors_n)
 
             new_generation = top_models[:10] + crossover_results + survivors
@@ -158,5 +158,5 @@ class GeneticAlgorithm:
             generation_sorting.purge()
             g += 1
         if self.parallel:
-            pool.close()
+            pool.terminate()
             pool.join()
