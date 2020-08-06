@@ -392,11 +392,11 @@ if __name__ == "__main__":
     _raw_data = pd.read_excel(os.path.join("data", "VB_Data_1a.xlsx"))                  # Data source
     _target = 'Response'                                                                # Column in data source to use as target attribute
     _raw_data = _raw_data.drop("ID", axis=1)
-    _raw_data = _raw_data.drop(["x5","x6","x7","x8","x9"], axis=1)
+    # _raw_data = _raw_data.drop(["x5","x6","x7","x8","x9"], axis=1)
     # _raw_data = _raw_data.drop(["x6","x7","x8","x9"], axis=1)
     #_raw_data = _raw_data.drop(["x1","x2","x3"], axis=1)
 
-    model_config = {"type": "GBR"}
+    model_config = {"type": "RFR"}
     ga_config = {
         "config":
             {
@@ -413,8 +413,7 @@ if __name__ == "__main__":
     amlr = AutomatedModelBuilder(
         _raw_data,
         _target,
-
-        genetic=False,
+        genetic=True,
         skip_transformations=False,
         skip_interactions=False,
         evaluation="rmse",

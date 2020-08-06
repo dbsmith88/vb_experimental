@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import sklearn.metrics as skm
 import sklearn as sk
+from sklearn.pipeline import make_pipeline
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, StackingRegressor
 import statsmodels.api as sm
 import statsmodels.stats.outliers_influence as smo
@@ -11,8 +12,10 @@ import scipy.stats
 
 
 class AnalyticalModel:
+    scorer_list = ['neg_mean_squared_error', 'neg_mean_absolute_error', 'r2']
 
-    def __init__(self, data: pd.DataFrame, target: str, training_split=0.8, one_out=False, model_config=None):
+    def __init__(self, data: pd.DataFrame, target: str, training_split=0.8, one_out=False, model_config=None,
+                 random_seed=42, cv_folds=10, cv_reps=20):
         self.target = target
         self.data = data
         self.attribute_data = self.data.drop(target, axis=1)
@@ -20,11 +23,29 @@ class AnalyticalModel:
         self.attributes = self.attribute_data.columns
         self.one_out = one_out
         self.training_split = training_split
-        self.train_n = int(self.data.shape[0] * self.training_split) if not self.one_out else int(self.data.shape[0])
-        # self.train_n = int(self.data.shape[0])
+        self.random_seed = random_seed
+        self.cv_folds = cv_folds
+        self.cv_reps =cv_reps
+        if one_out:
+            self.x_train, self.x_test, self.y_train, self.y_test = (
+                self.attribute_data,
+                self.attribute_data,
+                self.target_data,
+                self.target_data
+            )
+        else:
+            self.x_train, self.x_test, self.y_train, self.y_test = sk.model_selection.train_test_split(
+                self.attribute_data,
+                self.target_data,
+                test_size=(1. - self.training_split),
+                random_state=self.random_seed
+            )
+        # self.train_n = int(self.data.shape[0] * self.training_split) if not self.one_out else int(self.data.shape[0])
+        self.train_n = int(self.x_train.shape[0])
         self.model = None
         self.model_configs = model_config
         self.results = None
+        self.score = None
         self.confusion = None
         self.coef = None
         self.r2 = None
@@ -41,100 +62,114 @@ class AnalyticalModel:
         self.eval = None
         self.build_model()
 
-    def build_mlr(self, train_x, train_y, test_x, test_y, params):
+    def build_mlr(self, params):
         """
         Build, fit and predict with a multiple linear regression model.
-        :param train_x:
-        :param train_y:
-        :param test_x:
-        :param test_y:
         :param params:
         :return:
         """
-        self.model = sk.linear_model.LinearRegression(fit_intercept=True, **params)
-        self.results = self.model.fit(train_x, train_y)
-        pred_y = self.results.predict(test_x)
-        self.predictions = pred_y
-        test_y = test_y.to_numpy().flatten()
-        self.coef = self.results.coef_
-        res = test_y - pred_y
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            sk.linear_model.LinearRegression(**params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.score = self.model.score(self.x_test, self.y_test)
+        self.predictions = self.results.predict(self.x_test)
+        self.coef = None
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
         self.residuals = res
 
-    def build_linear_svr(self, train_x, train_y, test_x, test_y, params):
+    def build_linear_svr(self, params):
         """
         Build, fit and predict with a Linear Support Vector Regressor
-        :param train_x:
-        :param train_y:
-        :param test_x:
-        :param test_y:
         :param params:
         :return:
         """
-        n_train_x = sk.preprocessing.scale(train_x, axis=1)
-        self.model = sk.svm.LinearSVR(fit_intercept=True, loss='squared_epsilon_insensitive', random_state=0, **params)
-        self.results = self.model.fit(n_train_x, train_y)
-        pred_y = self.results.predict(test_x)
-        self.predictions = pred_y
-        test_y = test_y.to_numpy().flatten()
-        self.coef = self.results.coef_
-        res = test_y - pred_y
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            sk.svm.LinearSVR(random_state=self.random_seed, tol=1e-4, max_iter=5000, C=1, **params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.predictions = self.results.predict(self.x_test)
+        self.coef = None
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
         self.residuals = res
 
-    def build_gbr(self, train_x, train_y, test_x, test_y, params):
+    def build_gbr(self, params):
         """
         Build, fit and predict with a Gradient Boost Regressor
-        :param train_x:
-        :param train_y:
-        :param test_x:
-        :param test_y:
         :param params:
         :return:
         """
-        self.model = GradientBoostingRegressor(random_state=0, **params)
-        self.results = self.model.fit(train_x, train_y)
-        pred_y = self.results.predict(test_x)
-        self.predictions = pred_y
-        test_y = test_y.to_numpy().flatten()
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            GradientBoostingRegressor(random_state=self.random_seed, **params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.predictions = self.results.predict(self.x_test)
         self.coef = None
-        res = test_y - pred_y
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
         self.residuals = res
 
-    def build_elastic_net(self, train_x, train_y, test_x, test_y, params):
+    def build_elastic_net(self, params):
         """
         Build, fit and predict with an Elastic Net CV
-        :param train_x:
-        :param train_y:
-        :param test_x:
-        :param test_y:
+
         :param params:
         :return:
         """
-        self.model = sk.linear_model.ElasticNetCV(**params)
-        self.results = self.model.fit(train_x, train_y)
-        pred_y = self.results.predict(test_x)
-        self.predictions = pred_y
-        test_y = test_y.to_numpy().flatten()
-        self.coef = self.results.coef_
-        res = test_y - pred_y
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            sk.linear_model.ElasticNetCV(**params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.predictions = self.results.predict(self.x_test)
+        self.coef = None
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
         self.residuals = res
 
-    def build_rfr(self, train_x, train_y, test_x, test_y, params):
+    def build_rfr(self, params):
         """
         Build, fit and predict with a Random Forest Regressor
-        :param train_x:
-        :param train_y:
-        :param test_x:
-        :param test_y:
         :param params:
         :return:
         """
-        self.model = RandomForestRegressor(random_state=0, **params)
-        self.results = self.model.fit(train_x, train_y)
-        pred_y = self.results.predict(test_x)
-        self.predictions = pred_y
-        test_y = test_y.to_numpy().flatten()
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            RandomForestRegressor(random_state=self.random_seed, **params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.predictions = self.results.predict(self.x_test)
         self.coef = None
-        res = test_y - pred_y
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
+        self.residuals = res
+
+    def build_svr(self, params):
+        """
+        Build, fit and predict with a Support Vector Regressor
+        :param params:
+        :return:
+        """
+        self.model = make_pipeline(
+            sk.preprocessing.StandardScaler(),
+            sk.svm.SVR(kernel='rbf',tol=1e-4,max_iter=5000, C=1, **params)
+        )
+        y = self.y_train.to_numpy().flatten()
+        self.results = self.model.fit(self.x_train, y)
+        self.predictions = self.results.predict(self.x_test)
+        self.coef = None
+        y_test_f = self.y_test.to_numpy().flatten()
+        res = (y_test_f - self.predictions)
         self.residuals = res
 
     def build_stacker(self, train_x, train_y, test_x, test_y, params):
@@ -188,23 +223,25 @@ class AnalyticalModel:
         if "type" in model_configs.keys():
             params = model_configs["params"] if "params" in model_configs.keys() else {}
             if model_configs["type"] == "MLR":
-                self.build_mlr(x, y, test_x, test_y, params)
+                self.build_mlr(params)
             elif model_configs["type"] == "LinearSVR":
-                self.build_linear_svr(x, y, test_x, test_y, params)
+                self.build_linear_svr(params)
             elif model_configs["type"] == "GBR":
-                self.build_gbr(x, y, test_x, test_y, params)
+                self.build_gbr(params)
             elif model_configs["type"] == "RFR":
-                self.build_rfr(x, y, test_x, test_y, params)
+                self.build_rfr(params)
+            elif model_configs["type"] == "SVR":
+                self.build_svr(params)
             elif model_configs["type"] == "ElasticNetCV":
-                self.build_elastic_net(x, y, test_x, test_y, params)
-            elif model_configs["type"] == "Stacker":
-                self.build_stacker(x, y, test_x, test_y, params)
+                self.build_elastic_net(params)
+            # elif model_configs["type"] == "Stacker":
+            #     self.build_stacker(params)
             else:
-                self.build_mlr(x, y, test_x, test_y, params)
+                self.build_mlr(params)
         else:
             model_configs["type"] = "MLR"
             self.model_configs = model_configs
-            self.build_mlr(x, y, test_x, test_y, {})
+            self.build_mlr({})
 
         n = float(self.data.shape[0])
         p = float(self.data.shape[1] - 1.)
@@ -334,7 +371,7 @@ class AnalyticalModel:
         print("Total Training Records: {}\t\tTotal Testing Records: {}".format(self.train_n, test_data.shape[0]).expandtabs(15))
         print("R Squared: {}\t\tMean Squared Error: {}\t\tRoot Mean Squared Error: {}".format(round(self.r2,4), round(self.mse,4), round(self.rmse,4)).expandtabs(15))
         print("Max Error: {}\t\tMean Absolute Error: {}\t\tMedian Absolute Error: {}".format(
-            round(max_error, 4), round(mean_absolute_error,4), round(median_absolute_error,4)).expandtabs(15))
+            round(max_error, 4), round(mean_absolute_error, 4), round(median_absolute_error,4)).expandtabs(15))
 
     def print_summary2(self):
         print(self.results.summary())
